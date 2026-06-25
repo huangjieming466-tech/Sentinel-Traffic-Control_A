@@ -86,9 +86,9 @@ python3 benchmark.py
 ```
 
 ### 3. 启动智能交通系统
-连接两个 USB 摄像头后运行：
+连接两个 USB 摄像头后A板运行：
 ```bash
-python3 smart_traffic.py
+python3 traffic_master.py
 ```
 
 ## ⚠️ 注意事项
