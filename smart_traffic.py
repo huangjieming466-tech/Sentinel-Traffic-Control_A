@@ -141,14 +141,14 @@ def main():
         # 解析结果 A
         count_a = 0
         annotated_a = frame_a.copy()
-        for r in results_a:
+        for r in list(results_a): # 优化 ，加上 list() 可以避免迭代器被消耗，防止香橙派内存泄漏
             annotated_a = r.plot()
             count_a += len(r.boxes)
             
         # 解析结果 B
         count_b = 0
         annotated_b = frame_b.copy()
-        for r in results_b:
+        for r in list(results_b): # 优化 ，加上 list() 可以避免迭代器被消耗，防止香橙派内存泄漏
             annotated_b = r.plot()
             count_b += len(r.boxes)
 
@@ -168,7 +168,7 @@ def main():
         # 如果是绿灯，Wait_Time = 0
         score_a = count_a + (elapsed_time / 10.0 if current_state in [TrafficState.GREEN_B, TrafficState.YELLOW_B] else 0)
         score_b = count_b + (elapsed_time / 10.0 if current_state in [TrafficState.GREEN_A, TrafficState.YELLOW_A] else 0)
-        
+        #                                             状态 1： A路绿灯，B路红灯
         if current_state == TrafficState.GREEN_A:
             color_a = (0, 255, 0) # Green
             is_green_a = True
@@ -209,7 +209,7 @@ def main():
                 condition_met_start_time = 0 # 确保重置
             
             if remaining < 0: remaining = 0
-
+        #                                           状态  2： A路黄灯，B路红灯
         elif current_state == TrafficState.YELLOW_A:
             color_a = (0, 255, 255) # Yellow
             
@@ -221,7 +221,7 @@ def main():
                 condition_met_start_time = 0 # 重置去抖动
             
             remaining = YELLOW_TIME - elapsed_time
-
+        #                                            状态  3： A放行完毕全红清空期
         elif current_state == TrafficState.ALL_RED_A:
             # 全红状态：两边都是红灯
             color_a = (0, 0, 255) # Red
@@ -233,7 +233,7 @@ def main():
                 elapsed_time = 0
             
             remaining = ALL_RED_TIME - elapsed_time
-
+        #                                               状态  4： B路绿灯，A路红灯
         elif current_state == TrafficState.GREEN_B:
             color_b = (0, 255, 0) # Green
             is_green_b = True
@@ -267,7 +267,7 @@ def main():
                 condition_met_start_time = 0
                 
             if remaining < 0: remaining = 0
-
+        #                                               状态 5： B路黄灯，A路红灯
         elif current_state == TrafficState.YELLOW_B:
             color_b = (0, 255, 255) # Yellow
             
@@ -278,7 +278,7 @@ def main():
                 condition_met_start_time = 0
             
             remaining = YELLOW_TIME - elapsed_time
-
+        #                                                状态 6： B路放行完毕全红清空期
         elif current_state == TrafficState.ALL_RED_B:
             # 全红状态：两边都是红灯
             color_a = (0, 0, 255) # Red

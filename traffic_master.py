@@ -28,6 +28,7 @@ os.environ["GLOG_minloglevel"] = "3"
 os.environ["RKNN_LOG_LEVEL"] = "0"
 os.environ["QT_LOGGING_RULES"] = "*.warning=false"
 
+
 # Auto-detect DISPLAY from available X sockets
 def _find_display():
     if os.environ.get("DISPLAY"):
@@ -446,7 +447,7 @@ def main():
         print(f"[CAM] Error: cannot open camera {CAMERA_SOURCE}")
         rknn.release()
         sys.exit(1)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     stream_reader = RTSPStreamReader(cap).start()
