@@ -23,12 +23,13 @@ import threading
 import time
 import serial
 from collections import deque
-from relay_controller import RS485RelayController
 
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["RKNN_LOG_LEVEL"] = "0"
 os.environ["QT_LOGGING_RULES"] = "*.warning=false"
-
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;5000000"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
 
 # Auto-detect DISPLAY from available X sockets
 def _find_display():
@@ -62,6 +63,11 @@ MODEL_PATH = "/home/hkcrc1/Sentinel-Traffic-Control_A/yolov8n.rknn"
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUDRATE = 115200
 
+# RS485 relay board for real traffic light output
+# NOTE: LoRa uses /dev/ttyUSB0, so RS485 relay normally uses /dev/ttyUSB1
+RELAY_PORT = "/dev/ttyUSB1"
+RELAY_BAUDRATE = 9600
+
 CONF_THRESHOLD = 0.15
 IOU_THRESHOLD = 0.45
 
@@ -70,7 +76,7 @@ TARGET_CLASS_IDS = [2, 3, 5, 7]
 TARGET_CLASS_NAMES = ["car", "motorcycle", "bus", "truck"]
 
 # How often to send LIGHT commands to Board B (seconds)
-LIGHT_SEND_INTERVAL = 0.5
+LIGHT_SEND_INTERVAL = 0.511
 
 # Maximum age of Board B data before considering it stale (seconds)
 B_DATA_TIMEOUT = 3.0
@@ -269,8 +275,6 @@ class LoRaDuplex:
                             total += count
                 self.b_total = total
                 self.b_last_update = time.time()
-            # Send ACK
-            self._send_raw("ACK")
         elif msg == "ACK":
             self.last_ack_time = time.time()
             self.ack_count += 1
@@ -319,6 +323,128 @@ class LoRaDuplex:
             self.ser.close()
             print("[LoRa] serial closed")
 
+
+
+# ──────────────────────────────────────────────
+#  RS485 Relay Control (Modbus RTU traffic light output)
+# ──────────────────────────────────────────────
+
+class RS485RelayController:
+    """
+    4-channel RS485 Modbus relay controller for one road traffic light.
+
+    Relay mapping:
+        relay 0 = red light
+        relay 1 = yellow light
+        relay 2 = green light
+        relay 3 = spare
+
+    Relay board default serial format: 9600, N, 8, 1.
+    """
+
+    RELAY_COMMANDS = {
+        0: {
+            True:  bytes.fromhex("01 05 00 00 FF 00 8C 3A"),
+            False: bytes.fromhex("01 05 00 00 00 00 CD CA"),
+        },
+        1: {
+            True:  bytes.fromhex("01 05 00 01 FF 00 DD FA"),
+            False: bytes.fromhex("01 05 00 01 00 00 9C 0A"),
+        },
+        2: {
+            True:  bytes.fromhex("01 05 00 02 FF 00 2D FA"),
+            False: bytes.fromhex("01 05 00 02 00 00 6C 0A"),
+        },
+        3: {
+            True:  bytes.fromhex("01 05 00 03 FF 00 7C 3A"),
+            False: bytes.fromhex("01 05 00 03 00 00 3D CA"),
+        },
+    }
+
+    def __init__(self, port=RELAY_PORT, baudrate=RELAY_BAUDRATE, timeout=0.5):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser = None
+        self.last_light = None
+
+    def open(self):
+        try:
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=8,
+                parity=serial.PARITY_NONE,
+                stopbits=1,
+                timeout=self.timeout
+            )
+            print(f"[Relay] RS485 relay opened on {self.port} (baudrate={self.baudrate})")
+            self.all_off()
+            return True
+        except Exception as e:
+            print(f"[Relay] Error: cannot open RS485 relay {self.port}: {e}")
+            return False
+
+    def close(self):
+        try:
+            self.all_off()
+            if self.ser:
+                self.ser.close()
+                print("[Relay] RS485 relay closed")
+        except Exception as e:
+            print(f"[Relay] close error: {e}")
+
+    def _send(self, cmd):
+        if not self.ser:
+            return False
+        try:
+            self.ser.write(cmd)
+            self.ser.flush()
+            time.sleep(0.03)
+            return True
+        except Exception as e:
+            print(f"[Relay] send failed: {e}")
+            return False
+
+    def set_relay(self, relay_id, on):
+        return self._send(self.RELAY_COMMANDS[relay_id][on])
+
+    def all_off(self):
+        # Turn off all channels before selecting one lamp.
+        for relay_id in range(4):
+            self.set_relay(relay_id, False)
+        self.last_light = None
+
+    def set_light(self, light):
+        """
+        Set one lamp for this board.
+
+        light values:
+            "RED", "YELLOW", "GREEN", "OFF"
+        """
+        if light == self.last_light:
+            return True
+
+        # Safety rule: never allow red/yellow/green to be on at the same time.
+        for relay_id in range(4):
+            self.set_relay(relay_id, False)
+
+        if light == "RED":
+            ok = self.set_relay(0, True)
+        elif light == "YELLOW":
+            ok = self.set_relay(1, True)
+        elif light == "GREEN":
+            ok = self.set_relay(2, True)
+        elif light == "OFF":
+            ok = True
+        else:
+            print(f"[Relay] Unknown light state {light}, fallback to RED")
+            ok = self.set_relay(0, True)
+            light = "RED"
+
+        if ok:
+            self.last_light = light
+        return ok
 
 # ──────────────────────────────────────────────
 #  Visualization
@@ -448,7 +574,7 @@ def main():
         print(f"[CAM] Error: cannot open camera {CAMERA_SOURCE}")
         rknn.release()
         sys.exit(1)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     stream_reader = RTSPStreamReader(cap).start()
@@ -469,6 +595,17 @@ def main():
     # ── 4. Init Allocator ──
     allocator = TrafficLightAllocator()
     print("[Allocator] Traffic light state machine ready")
+
+    # ── 4.5 Init RS485 Relay Output ──
+    relay = RS485RelayController(RELAY_PORT, RELAY_BAUDRATE)
+    if not relay.open():
+        print("[Relay] ERROR: Check RS485 relay board connection")
+        lora.close()
+        stream_reader.stop()
+        cap.release()
+        rknn.release()
+        sys.exit(1)
+    print("[Relay] A-side traffic light output ready")
 
     # ── 5. Main Loop ──
     frame_count = 0
@@ -517,9 +654,23 @@ def main():
             b_counts, count_b, b_last_update = lora.get_b_data()
             b_fresh = lora.is_b_data_fresh()
 
+            # When B data is stale, keep using the last known count_b.
+            # The single master allocator continues cycling naturally;
+            # when congestion data stops updating, it falls back to
+            # MAX_GREEN_TIME-based switching (pure 30s timer mode).
+            # This matches the original traffic_master.py behavior.
+
             # ── Run allocator ──
             state, remaining, color_a, color_b, is_green_a, is_green_b, score_a, score_b = \
                 allocator.update(count_a, count_b)
+
+            # ── Drive A-side real traffic light through RS485 relay ──
+            if state == TrafficState.GREEN_A:
+                relay.set_light("GREEN")
+            elif state == TrafficState.YELLOW_A:
+                relay.set_light("YELLOW")
+            else:
+                relay.set_light("RED")
 
             # ── Send light command to Board B (periodic) ──
             now = time.time()
@@ -559,6 +710,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[MAIN] User interrupt")
     finally:
+        relay.close()
         lora.close()
         stream_reader.stop()
         cap.release()

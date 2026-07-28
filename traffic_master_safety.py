@@ -2,7 +2,7 @@
 """
 traffic_master.py - Board A Master Controller
 =============================================
-Runs on: 192.168.20.175 (hkcrc1)
+Runs on: 192.168.20.*** (hkcrc1)
 
 This is the master traffic light controller. It:
   1. Detects vehicles on Road A via NPU (YOLOv8-RKNN)
@@ -22,13 +22,12 @@ import sys
 import threading
 import time
 import serial
+import queue
 from collections import deque
-from relay_controller import RS485RelayController
 
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["RKNN_LOG_LEVEL"] = "0"
 os.environ["QT_LOGGING_RULES"] = "*.warning=false"
-
 
 # Auto-detect DISPLAY from available X sockets
 def _find_display():
@@ -48,8 +47,9 @@ import cv2
 import numpy as np
 from rknnlite.api import RKNNLite
 
-# Import the allocator (same directory)
+# Import the allocator and relay controller (same directory)
 from traffic_light_allocator import TrafficLightAllocator, TrafficState
+from relay_controller import RS485RelayController
 
 # ──────────────────────────────────────────────
 #  Configuration
@@ -61,6 +61,11 @@ CAMERA_SOURCE = "rtsp://admin:HKcrc3130@192.168.1.64:554/h264/ch1/main/av_stream
 MODEL_PATH = "/home/hkcrc1/Sentinel-Traffic-Control_A/yolov8n.rknn"
 SERIAL_PORT = "/dev/ttyUSB0"
 BAUDRATE = 115200
+
+# RS485 relay board for real traffic light output
+# NOTE: LoRa uses /dev/ttyUSB0, so RS485 relay normally uses /dev/ttyUSB1
+RELAY_PORT = "/dev/ttyUSB1"
+RELAY_BAUDRATE = 9600
 
 CONF_THRESHOLD = 0.15
 IOU_THRESHOLD = 0.45
@@ -163,35 +168,98 @@ class YOLOv8_Fast_PostProcess:
 
 
 # ──────────────────────────────────────────────
-#  RTSP Stream Reader (threaded camera capture)
+#  RTSP Stream Reader (latest-frame queue + auto reconnect)
 # ──────────────────────────────────────────────
 
 class RTSPStreamReader:
-    """Threaded video capture for smooth frame reading."""
+    """
+    Thread-safe video capture with automatic reconnection.
 
-    def __init__(self, capture):
-        self.cap = capture
-        self.ret = False
-        self.frame = None
+    - Background thread continuously reads RTSP frames.
+    - queue.Queue(maxsize=1) keeps only the latest frame, drops stale ones.
+    - If RTSP stream fails, releases old capture and automatically reconnects.
+    """
+
+    RECONNECT_DELAY = 2.0   # 重连间隔（秒）
+
+    def __init__(self, source, width=640, height=480):
+        self.source = source
+        self.width = width
+        self.height = height
+        self.cap = None
         self.stopped = False
+        self.frame_queue = queue.Queue(maxsize=1)  # 只保留最新帧
 
     def start(self):
-        threading.Thread(target=self.update, args=(), daemon=True).start()
+        """启动后台拉流线程，返回self支持链式调用"""
+        self._open_capture()
+        self.stopped = False
+        threading.Thread(target=self._update, args=(), daemon=True).start()
         return self
 
-    def update(self):
-        while not self.stopped:
-            if not self.cap.isOpened():
-                break
-            self.ret, self.frame = self.cap.read()
-            if not self.ret:
-                self.stopped = True
-
     def read_latest(self):
-        return self.ret, self.frame
+        """非阻塞取最新帧，没有则返回(False, None)"""
+        try:
+            return self.frame_queue.get_nowait()
+        except queue.Empty:
+            return (False, None)
 
     def stop(self):
+        """停止线程并释放摄像头"""
         self.stopped = True
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
+    def _open_capture(self):
+        """打开RTSP摄像头，配置缓冲和分辨率"""
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
+        self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+
+        if self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            return True
+
+        return False
+
+    def _update(self):
+        """后台线程：持续读帧 + 断线自动重连"""
+        while not self.stopped:
+            if self.cap is None or not self.cap.isOpened():
+                print("[CAM] Stream lost — attempting reconnect ...")
+                if not self._open_capture():
+                    time.sleep(self.RECONNECT_DELAY)
+                    continue
+                print("[CAM] Reconnect succeeded")
+
+            ret, frame = self.cap.read()
+
+            if not ret or frame is None:
+                print("[CAM] Frame read failed, reconnecting ...")
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+                time.sleep(self.RECONNECT_DELAY)
+                continue
+
+            # 丢弃旧帧，只保留最新帧
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            self.frame_queue.put((True, frame))
 
 
 # ──────────────────────────────────────────────
@@ -318,8 +386,6 @@ class LoRaDuplex:
         if self.ser:
             self.ser.close()
             print("[LoRa] serial closed")
-
-
 # ──────────────────────────────────────────────
 #  Visualization
 # ──────────────────────────────────────────────
@@ -443,16 +509,13 @@ def main():
 
     # ── 2. Init Camera ──
     print(f"[CAM] Opening camera: {CAMERA_SOURCE}")
-    cap = cv2.VideoCapture(CAMERA_SOURCE)
-    if not cap.isOpened():
+    stream_reader = RTSPStreamReader(CAMERA_SOURCE).start()
+    time.sleep(1.0)  # 等待第一帧到达
+    if stream_reader.cap is None or not stream_reader.cap.isOpened():
         print(f"[CAM] Error: cannot open camera {CAMERA_SOURCE}")
+        stream_reader.stop()
         rknn.release()
         sys.exit(1)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    stream_reader = RTSPStreamReader(cap).start()
-    time.sleep(1.0)
     print("[CAM] Camera ready")
 
     # ── 3. Init LoRa ──
@@ -460,7 +523,7 @@ def main():
     lora = LoRaDuplex(SERIAL_PORT, BAUDRATE)
     if not lora.open():
         print("[LoRa] ERROR: Check LoRa module connection")
-        cap.release()
+        stream_reader.stop()
         rknn.release()
         sys.exit(1)
     lora.start_receiver()
@@ -469,6 +532,16 @@ def main():
     # ── 4. Init Allocator ──
     allocator = TrafficLightAllocator()
     print("[Allocator] Traffic light state machine ready")
+
+    # ── 4.5 Init RS485 Relay Output ──
+    relay = RS485RelayController(RELAY_PORT, RELAY_BAUDRATE)
+    if not relay.open():
+        print("[Relay] ERROR: Check RS485 relay board connection")
+        lora.close()
+        stream_reader.stop()
+        rknn.release()
+        sys.exit(1)
+    print("[Relay] A-side traffic light output ready")
 
     # ── 5. Main Loop ──
     frame_count = 0
@@ -517,9 +590,24 @@ def main():
             b_counts, count_b, b_last_update = lora.get_b_data()
             b_fresh = lora.is_b_data_fresh()
 
+            # ── P0 Safety Fallback: do not use stale Board B data ──
+            # If Board B detection data is older than B_DATA_TIMEOUT,
+            # reset Road B count to 0 before running the allocator.
+            if not b_fresh:
+                count_b = 0
+                b_counts = {name: 0 for name in TARGET_CLASS_NAMES}
+
             # ── Run allocator ──
             state, remaining, color_a, color_b, is_green_a, is_green_b, score_a, score_b = \
                 allocator.update(count_a, count_b)
+
+            # ── Drive A-side real traffic light through RS485 relay ──
+            if state == TrafficState.GREEN_A:
+                relay.set_light("GREEN")
+            elif state == TrafficState.YELLOW_A:
+                relay.set_light("YELLOW")
+            else:
+                relay.set_light("RED")
 
             # ── Send light command to Board B (periodic) ──
             now = time.time()
@@ -559,9 +647,9 @@ def main():
     except KeyboardInterrupt:
         print("\n[MAIN] User interrupt")
     finally:
+        relay.close()
         lora.close()
         stream_reader.stop()
-        cap.release()
         rknn.release()
         cv2.destroyAllWindows()
         print("[MAIN] Resources released, exiting")

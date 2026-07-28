@@ -18,17 +18,16 @@ LoRa Protocol:
 """
 
 import os
+import re
 import sys
 import threading
 import time
 import serial
 from collections import deque
-from relay_controller import RS485RelayController
 
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["RKNN_LOG_LEVEL"] = "0"
 os.environ["QT_LOGGING_RULES"] = "*.warning=false"
-
 
 # Auto-detect DISPLAY from available X sockets
 def _find_display():
@@ -74,6 +73,13 @@ LIGHT_SEND_INTERVAL = 0.5
 
 # Maximum age of Board B data before considering it stale (seconds)
 B_DATA_TIMEOUT = 3.0
+
+# ── Fallback / Degraded mode (Board B data staleness) ──
+DEGRADED_ENTER_TIMEOUT = 8.0   # Seconds of stale B data before full degraded
+DEGRADED_MIN_VEHICLES = 3      # Synthetic count_b floor in stale-warning tier
+
+# ── LoRa health monitoring ──
+LORA_ERROR_LOG_INTERVAL = 30   # Print LoRa error summary every N seconds
 
 COCO_CLASSES = [
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
@@ -220,6 +226,13 @@ class LoRaDuplex:
         self.ack_count = 0
         self.last_ack_time = 0.0
 
+        # Health / error tracking
+        self.parse_error_count = 0   # Malformed DET messages discarded
+        self.tx_ok_count = 0
+        self.tx_err_count = 0
+        self.rx_ok_count = 0
+        self._last_error_log_time = 0.0
+
     def open(self):
         try:
             self.ser = serial.Serial(self.port, self.baudrate, timeout=2)
@@ -248,34 +261,49 @@ class LoRaDuplex:
                 print(f"  [LoRa] receive error: {e}")
             time.sleep(0.05)
 
+    # Regex: validate exact format before parsing
+    # Expected: DET:car:N,motorcycle:N,bus:N,truck:N  (order fixed, all four required)
+    _DET_RE = re.compile(
+        r'^DET:car:(\d+),motorcycle:(\d+),bus:(\d+),truck:(\d+)$'
+    )
+
     def _handle_message(self, msg):
-        """Parse incoming messages from Board B."""
+        """Parse incoming messages from Board B with format validation."""
         if msg.startswith("DET:"):
-            # Board B is sending its detection results
-            # Format: DET:car:3,motorcycle:1,bus:0,truck:2
-            data = msg[4:]
-            pairs = data.split(",")
+            m = self._DET_RE.match(msg)
+            if not m:
+                # Malformed message — discard entirely, do NOT partially update
+                with self.lock:
+                    self.parse_error_count += 1
+                now = time.time()
+                if now - self._last_error_log_time > LORA_ERROR_LOG_INTERVAL:
+                    self._last_error_log_time = now
+                    print(f"  [LoRa] PARSE ERROR (#{self.parse_error_count}): "
+                          f"malformed DET dropped: {msg[:80]}")
+                return  # <-- skip ACK for bad messages
+
+            # Valid message: atomic update (all 4 fields parsed successfully)
+            try:
+                counts = [int(m.group(i)) for i in range(1, 5)]
+            except ValueError:
+                return  # unreachable with \d+ regex, defense in depth
+
             with self.lock:
-                total = 0
-                for pair in pairs:
-                    if ":" in pair:
-                        cls_name, count_str = pair.split(":", 1)
-                        try:
-                            count = int(count_str)
-                        except ValueError:
-                            count = 0
-                        if cls_name in self.b_counts:
-                            self.b_counts[cls_name] = count
-                            total += count
-                self.b_total = total
+                for i, cls_name in enumerate(TARGET_CLASS_NAMES):
+                    self.b_counts[cls_name] = counts[i]
+                self.b_total = sum(counts)
                 self.b_last_update = time.time()
-            # Send ACK
+                self.rx_ok_count += 1
+            # Send ACK for valid DET
             self._send_raw("ACK")
+
         elif msg == "ACK":
             self.last_ack_time = time.time()
             self.ack_count += 1
+
         elif msg.startswith("PING"):
             self._send_raw("PONG")
+
         else:
             # Unknown message, ignore silently
             pass
@@ -290,13 +318,17 @@ class LoRaDuplex:
         self._send_raw(msg)
 
     def _send_raw(self, message):
-        """Send a raw string over LoRa serial."""
+        """Send a raw string over LoRa serial.  Returns True on success."""
         if self.ser:
             try:
                 data = (message + "\n").encode('utf-8')
                 self.ser.write(data)
+                with self.lock:
+                    self.tx_ok_count += 1
                 return True
             except Exception as e:
+                with self.lock:
+                    self.tx_err_count += 1
                 print(f"  [LoRa] send failed: {e}")
                 return False
         return False
@@ -313,11 +345,105 @@ class LoRaDuplex:
                 return False
             return (time.time() - self.b_last_update) < B_DATA_TIMEOUT
 
+    def get_health(self):
+        """Return a snapshot of LoRa health counters (thread-safe)."""
+        with self.lock:
+            return {
+                'b_last_update': self.b_last_update,
+                'b_data_age': (time.time() - self.b_last_update) if self.b_last_update > 0 else None,
+                'parse_error_count': self.parse_error_count,
+                'tx_ok_count': self.tx_ok_count,
+                'tx_err_count': self.tx_err_count,
+                'rx_ok_count': self.rx_ok_count,
+                'ack_count': self.ack_count,
+            }
+
     def close(self):
         self.running = False
         if self.ser:
             self.ser.close()
             print("[LoRa] serial closed")
+
+
+# ──────────────────────────────────────────────
+#  StaleDataFallback — Board B data staleness handler
+# ──────────────────────────────────────────────
+
+class StaleDataFallback:
+    """
+    Sanitizes count_b when Board B data goes stale, preventing Road A
+    from permanently holding the green light.
+
+    Three tiers based on data age:
+
+        NORMAL  (age < B_DATA_TIMEOUT, 3s):
+            Real count_b passed through unchanged.
+
+        STALE   (3s <= age < DEGRADED_ENTER_TIMEOUT, 8s):
+            count_b clamped to at least DEGRADED_MIN_VEHICLES (3).
+            This gives Road B enough presence to compete via the
+            patience-score congestion path.
+
+        DEGRADED (age >= 8s):
+            Last-known-good count_b is preserved.  Together with
+            MAX_GREEN_TIME (30s), this guarantees Road B still gets
+            periodic green cycles.
+    """
+
+    def __init__(self):
+        self._last_good_count_b = 0
+        self._last_good_b_counts = {name: 0 for name in TARGET_CLASS_NAMES}
+        self.current_tier = "NORMAL"  # NORMAL / STALE / DEGRADED
+        self.degraded_since = 0.0     # timestamp when degraded mode entered
+
+    def sanitize(self, raw_count_b, raw_b_counts, b_fresh):
+        """
+        Return (effective_count_b, effective_b_counts, tier_name).
+
+        Args:
+            raw_count_b (int): The count_b from LoRa (may be 0 if stale).
+            raw_b_counts (dict): Per-class counts from LoRa.
+            b_fresh (bool): Whether Board B data is fresh (< B_DATA_TIMEOUT).
+
+        Returns:
+            tuple: (int, dict, str)
+        """
+        if b_fresh:
+            # ── Tier NORMAL — real data, pass through ──
+            self._last_good_count_b = raw_count_b
+            self._last_good_b_counts = dict(raw_b_counts)
+            self.current_tier = "NORMAL"
+            self.degraded_since = 0.0
+            self._stale_since = 0.0
+            return raw_count_b, raw_b_counts, "NORMAL"
+
+        # Data is stale (age >= B_DATA_TIMEOUT)
+        now = time.time()
+
+        if self.current_tier == "NORMAL":
+            # Just entered staleness — start the escalation timer
+            self._stale_since = now
+
+        stale_duration = now - self._stale_since if self._stale_since > 0 else 0
+
+        if stale_duration < (DEGRADED_ENTER_TIMEOUT - B_DATA_TIMEOUT):
+            # ── Tier STALE — clamp count_b to minimum ──
+            self.current_tier = "STALE"
+            effective = max(raw_count_b, DEGRADED_MIN_VEHICLES)
+            return effective, self._last_good_b_counts, "STALE"
+        else:
+            # ── Tier DEGRADED — preserve last good data ──
+            if self.current_tier != "DEGRADED":
+                self.current_tier = "DEGRADED"
+                self.degraded_since = now
+                print(f"  [Fallback] ENTERING DEGRADED MODE "
+                      f"(B data stale for {stale_duration:.0f}s, "
+                      f"last good count_b={self._last_good_count_b})")
+            return self._last_good_count_b, self._last_good_b_counts, "DEGRADED"
+
+    def is_degraded(self):
+        """Return True if currently in DEGRADED tier."""
+        return self.current_tier == "DEGRADED"
 
 
 # ──────────────────────────────────────────────
@@ -331,7 +457,8 @@ def draw_traffic_light(frame, x, y, color, radius=30):
 
 
 def draw_master_display(frame, detections, class_counts, total_count,
-                         allocator, b_counts, b_total, b_fresh, fps):
+                         allocator, b_counts, b_total, b_fresh, fps,
+                         fallback_tier="NORMAL", health=None):
     """
     Draw the master control panel overlay on the frame.
 
@@ -339,11 +466,12 @@ def draw_master_display(frame, detections, class_counts, total_count,
       - Detection summary
       - Traffic light state
       - Board B remote data
+      - Health / LoRa status
     """
     h, w = frame.shape[:2]
 
     # ── Left panel background ──
-    panel_w = 240
+    panel_w = 270
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (panel_w, h), (40, 40, 40), -1)
     cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
@@ -352,47 +480,71 @@ def draw_master_display(frame, detections, class_counts, total_count,
     font = cv2.FONT_HERSHEY_SIMPLEX
 
     # ── Title ──
-    cv2.putText(frame, "MASTER (Board A)", (10, y), font, 0.7, (0, 255, 255), 2)
+    cv2.putText(frame, "MASTER (Board A)", (10, y), font, 0.9, (0, 255, 255), 2)
     y += 30
 
     # ── Road A detection ──
-    cv2.putText(frame, "--- Road A (Local) ---", (10, y), font, 0.5, (200, 200, 200), 1)
+    cv2.putText(frame, "--- Road A (Local) ---", (10, y), font, 0.65, (200, 200, 200), 1)
     y += 22
     for cls_name in TARGET_CLASS_NAMES:
         cnt = class_counts.get(cls_name, 0)
-        cv2.putText(frame, f"  {cls_name}: {cnt}", (10, y), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, f"  {cls_name}: {cnt}", (10, y), font, 0.65, (255, 255, 255), 1)
         y += 20
-    cv2.putText(frame, f"  TOTAL: {total_count}", (10, y), font, 0.6, (0, 255, 0), 1)
+    cv2.putText(frame, f"  TOTAL: {total_count}", (10, y), font, 0.7, (0, 255, 0), 1)
     y += 28
 
     # ── Road B detection (from LoRa) ──
-    cv2.putText(frame, "--- Road B (Remote) ---", (10, y), font, 0.5, (200, 200, 200), 1)
+    cv2.putText(frame, "--- Road B (Remote) ---", (10, y), font, 0.65, (200, 200, 200), 1)
     y += 22
     if b_fresh:
         for cls_name in TARGET_CLASS_NAMES:
             cnt = b_counts.get(cls_name, 0)
-            cv2.putText(frame, f"  {cls_name}: {cnt}", (10, y), font, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, f"  {cls_name}: {cnt}", (10, y), font, 0.65, (255, 255, 255), 1)
             y += 20
-        cv2.putText(frame, f"  TOTAL: {b_total}", (10, y), font, 0.6, (0, 255, 0), 1)
+        cv2.putText(frame, f"  TOTAL: {b_total}", (10, y), font, 0.7, (0, 255, 0), 1)
     else:
-        cv2.putText(frame, "  NO DATA", (10, y), font, 0.5, (0, 0, 255), 1)
+        cv2.putText(frame, "  NO DATA", (10, y), font, 0.65, (0, 0, 255), 1)
     y += 28
 
     # ── Light state ──
     state = allocator.current_state
-    cv2.putText(frame, "--- Light State ---", (10, y), font, 0.5, (200, 200, 200), 1)
+    cv2.putText(frame, "--- Light State ---", (10, y), font, 0.65, (200, 200, 200), 1)
     y += 22
-    cv2.putText(frame, f"  {state.name}", (10, y), font, 0.6, (0, 255, 255), 2)
+    cv2.putText(frame, f"  {state.name}", (10, y), font, 0.75, (0, 255, 255), 2)
     y += 24
-    cv2.putText(frame, f"  Remaining: {allocator.remaining_time:.1f}s", (10, y), font, 0.5, (255, 255, 255), 1)
+    cv2.putText(frame, f"  Remaining: {allocator.remaining_time:.1f}s", (10, y), font, 0.65, (255, 255, 255), 1)
     y += 22
-    cv2.putText(frame, f"  Switches: {allocator.total_switches}", (10, y), font, 0.5, (200, 200, 200), 1)
+    cv2.putText(frame, f"  Switches: {allocator.total_switches}", (10, y), font, 0.65, (200, 200, 200), 1)
     y += 22
-    cv2.putText(frame, f"  Reason: {allocator.last_switch_reason}", (10, y), font, 0.4, (180, 180, 180), 1)
+    cv2.putText(frame, f"  Reason: {allocator.last_switch_reason}", (10, y), font, 0.65, (180, 180, 180), 1)
     y += 28
 
+    # ── Health ──
+    tier_color = (0, 255, 0) if fallback_tier == "NORMAL" else \
+                 (0, 255, 255) if fallback_tier == "STALE" else (0, 0, 255)
+    cv2.putText(frame, "--- Health ---", (10, y), font, 0.65, (200, 200, 200), 1)
+    y += 22
+    cv2.putText(frame, f"  Mode: {fallback_tier}", (10, y), font, 0.65, tier_color, 1)
+    y += 22
+
+    if health:
+        if health['b_data_age'] is not None:
+            age_s = health['b_data_age']
+            age_color = (0, 255, 0) if age_s < 3 else (0, 255, 255) if age_s < 8 else (0, 0, 255)
+            cv2.putText(frame, f"  B data: {age_s:.1f}s ago", (10, y), font, 0.65, age_color, 1)
+            y += 22
+        tx_total = health['tx_ok_count'] + health['tx_err_count']
+        cv2.putText(frame, f"  LoRa TX: {health['tx_ok_count']}/{tx_total}", (10, y), font, 0.65, (200, 200, 200), 1)
+        y += 22
+        cv2.putText(frame, f"  LoRa RX: {health['rx_ok_count']} ok", (10, y), font, 0.65, (200, 200, 200), 1)
+        y += 22
+        if health['parse_error_count'] > 0:
+            cv2.putText(frame, f"  Parse err: {health['parse_error_count']}", (10, y), font, 0.65, (0, 165, 255), 1)
+            y += 22
+
     # ── FPS ──
-    cv2.putText(frame, f"FPS: {fps:.1f}", (10, h - 15), font, 0.5, (0, 255, 0), 1)
+    fps_color = (0, 255, 0) if fps > 15 else (0, 255, 255) if fps > 10 else (0, 0, 255)
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10, h - 15), font, 0.65, fps_color, 1)
 
     # ── Right side: Traffic lights ──
     light_x = w - 60
@@ -407,12 +559,12 @@ def draw_master_display(frame, detections, class_counts, total_count,
     # Road A: label left of circle, status below circle
     cv2.putText(frame, "A", (light_x - 35, light_y + 8), font, 0.8, (255, 255, 255), 2)
     draw_traffic_light(frame, light_x, light_y, allocator.color_a, 25)
-    cv2.putText(frame, a_status, (light_x - 20, light_y + 48), font, 0.5, a_color, 2)
+    cv2.putText(frame, a_status, (light_x - 20, light_y + 48), font, 0.65, a_color, 2)
 
     # Road B: label left of circle, status below circle
     cv2.putText(frame, "B", (light_x - 35, light_y + 82), font, 0.8, (255, 255, 255), 2)
     draw_traffic_light(frame, light_x, light_y + 70, allocator.color_b, 25)
-    cv2.putText(frame, b_status, (light_x - 20, light_y + 118), font, 0.5, b_color, 2)
+    cv2.putText(frame, b_status, (light_x - 20, light_y + 118), font, 0.65, b_color, 2)
 
     return frame
 
@@ -448,7 +600,7 @@ def main():
         print(f"[CAM] Error: cannot open camera {CAMERA_SOURCE}")
         rknn.release()
         sys.exit(1)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     stream_reader = RTSPStreamReader(cap).start()
@@ -466,9 +618,12 @@ def main():
     lora.start_receiver()
     print("[LoRa] Duplex communication ready")
 
-    # ── 4. Init Allocator ──
+    # ── 4. Init Allocator & Fallback ──
     allocator = TrafficLightAllocator()
     print("[Allocator] Traffic light state machine ready")
+
+    fallback = StaleDataFallback()
+    print("[Fallback] Board B staleness handler ready")
 
     # ── 5. Main Loop ──
     frame_count = 0
@@ -517,9 +672,13 @@ def main():
             b_counts, count_b, b_last_update = lora.get_b_data()
             b_fresh = lora.is_b_data_fresh()
 
-            # ── Run allocator ──
+            # ── Sanitize count_b through fallback (P0 fix) ──
+            effective_count_b, effective_b_counts, fallback_tier = \
+                fallback.sanitize(count_b, b_counts, b_fresh)
+
+            # ── Run allocator with effective count_b ──
             state, remaining, color_a, color_b, is_green_a, is_green_b, score_a, score_b = \
-                allocator.update(count_a, count_b)
+                allocator.update(count_a, effective_count_b)
 
             # ── Send light command to Board B (periodic) ──
             now = time.time()
@@ -527,10 +686,14 @@ def main():
                 lora.send_light_command(state, remaining)
                 last_light_send = now
 
+            # ── Get health snapshot ──
+            health = lora.get_health()
+
             # ── Draw master display ──
             frame = draw_master_display(
                 frame, detections, class_counts, count_a,
-                allocator, b_counts, count_b, b_fresh, fps)
+                allocator, effective_b_counts, effective_count_b, b_fresh, fps,
+                fallback_tier=fallback_tier, health=health)
 
             # ── Show ──
             show_frame = cv2.resize(frame, (1280, 720))
@@ -552,9 +715,11 @@ def main():
 
             # ── Status print (every 30 frames) ──
             if frame_count % 30 == 0:
-                b_info = f"B_total={count_b}" if b_fresh else "B=NO_DATA"
-                print(f"  [{state.name}] A_count={count_a} {b_info} "
-                      f"remaining={remaining:.1f}s FPS={fps:.1f}")
+                b_info = f"B={effective_count_b}" if b_fresh else f"B={effective_count_b}({fallback_tier})"
+                print(f"  [{state.name}] A={count_a} {b_info} "
+                      f"rem={remaining:.1f}s FPS={fps:.1f} "
+                      f"LoRa TX:{health['tx_ok_count']}/{health['tx_ok_count']+health['tx_err_count']} "
+                      f"RX:{health['rx_ok_count']}")
 
     except KeyboardInterrupt:
         print("\n[MAIN] User interrupt")
