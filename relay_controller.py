@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import serial
 import time
 
@@ -6,11 +7,18 @@ import time
 class RS485RelayController:
     """
     4-channel RS485 Modbus relay controller.
+
     Relay mapping:
         relay 0 = red
         relay 1 = yellow
         relay 2 = green
         relay 3 = spare
+
+    Design:
+        1. Only update last_state after commands succeed.
+        2. Failed writes do NOT update last_state.
+        3. Failed writes are retried.
+        4. Before changing color, all relays are turned off first.
     """
 
     RELAY_COMMANDS = {
@@ -32,12 +40,29 @@ class RS485RelayController:
         },
     }
 
-    def __init__(self, port="/dev/ttyUSB1", baudrate=9600, timeout=0.5):
+    def __init__(
+        self,
+        port="/dev/ttyUSB1",
+        baudrate=9600,
+        timeout=0.5,
+        retry_count=3
+    ):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self.retry_count = retry_count
+
         self.ser = None
+
+        # IMPORTANT:
+        # This means "the last state that software believes
+        # was successfully sent to the relay".
         self.last_state = None
+
+
+    # ============================================================
+    # Serial open / close
+    # ============================================================
 
     def open(self):
         try:
@@ -47,70 +72,331 @@ class RS485RelayController:
                 bytesize=8,
                 parity=serial.PARITY_NONE,
                 stopbits=1,
-                timeout=self.timeout
+                timeout=self.timeout,
+                write_timeout=self.timeout
             )
-            print(f"[Relay] RS485 relay opened on {self.port}, baudrate={self.baudrate}")
-            self.all_off()
+
+            print(
+                f"[Relay] RS485 relay opened on "
+                f"{self.port}, baudrate={self.baudrate}"
+            )
+
+            # Clear all relays on startup.
+            if not self.all_off():
+                print("[Relay] WARNING: failed to turn all relays off at startup")
+                self.last_state = None
+
             return True
+
         except Exception as e:
             print(f"[Relay] Failed to open RS485 relay: {e}")
+            self.ser = None
             return False
+
 
     def close(self):
         try:
+            # Try to leave hardware in a safe state.
             self.all_off()
+
             if self.ser:
                 self.ser.close()
-                print("[Relay] RS485 relay closed")
+                self.ser = None
+
+            self.last_state = None
+
+            print("[Relay] RS485 relay closed")
+
         except Exception as e:
             print(f"[Relay] Close error: {e}")
 
-    def _write_cmd(self, cmd):
-        if not self.ser:
+
+    # ============================================================
+    # Low-level RS485 communication
+    # ============================================================
+
+    def _write_cmd_once(self, cmd):
+        """
+        Send one Modbus command once.
+
+        Returns:
+            True  -> serial write completed without exception
+            False -> serial write failed
+
+        NOTE:
+            This only confirms that the command was written to
+            the serial port. It does NOT yet confirm that the
+            physical relay really changed state.
+        """
+
+        if self.ser is None:
+            print("[Relay] Serial port is not open")
             return False
+
         try:
             self.ser.write(cmd)
             self.ser.flush()
+
+            # Give the RS485 relay a short time to execute.
             time.sleep(0.03)
+
             return True
+
         except Exception as e:
             print(f"[Relay] Write failed: {e}")
             return False
 
+
+    def _write_cmd(self, cmd):
+        """
+        Send one command with retry.
+
+        Returns:
+            True if one attempt succeeds.
+            False if all attempts fail.
+        """
+
+        for attempt in range(1, self.retry_count + 1):
+
+            if self._write_cmd_once(cmd):
+                return True
+
+            print(
+                f"[Relay] Retry "
+                f"{attempt}/{self.retry_count}"
+            )
+
+            time.sleep(0.05)
+
+        print("[Relay] Command failed after all retries")
+        return False
+
+
+    # ============================================================
+    # Relay control
+    # ============================================================
+
     def set_relay(self, relay_id, on):
+        """
+        Control one relay.
+
+        Args:
+            relay_id: 0 / 1 / 2 / 3
+            on: True / False
+
+        Returns:
+            True on serial write success.
+            False on failure.
+        """
+
+        if relay_id not in self.RELAY_COMMANDS:
+            print(f"[Relay] Invalid relay id: {relay_id}")
+            return False
+
         cmd = self.RELAY_COMMANDS[relay_id][on]
+
         return self._write_cmd(cmd)
 
+
     def all_off(self):
-        self.set_relay(0, False)
-        self.set_relay(1, False)
-        self.set_relay(2, False)
-        self.set_relay(3, False)
+        """
+        Turn off all relays.
+
+        Returns True only if all four commands succeed.
+        """
+
+        success = True
+
+        for relay_id in range(4):
+
+            ok = self.set_relay(relay_id, False)
+
+            if not ok:
+                print(
+                    f"[Relay] Failed to turn OFF "
+                    f"relay {relay_id}"
+                )
+                success = False
+
+        return success
+
+
+    # ============================================================
+    # Traffic light high-level API
+    # ============================================================
 
     def set_light(self, color):
         """
-        color:
-            "RED"
-            "YELLOW"
-            "GREEN"
-            "OFF"
-        """
-        if color == self.last_state:
-            return
+        Set traffic light color.
 
-        # 先全关，避免红黄绿同时亮
-        self.all_off()
+        Supported:
+            RED
+            YELLOW
+            GREEN
+            OFF
+
+        Returns:
+            True  -> command sequence succeeded
+            False -> command sequence failed
+        """
+
+        color = color.upper()
+
+        # --------------------------------------------------------
+        # Same state:
+        # skip repeated command ONLY because the previous command
+        # was considered successful.
+        # --------------------------------------------------------
+
+        if color == self.last_state:
+            return True
+
+
+        # --------------------------------------------------------
+        # Validate color
+        # --------------------------------------------------------
+
+        if color not in ("RED", "YELLOW", "GREEN", "OFF"):
+
+            print(
+                f"[Relay] Unknown light color: {color}, "
+                f"falling back to RED"
+            )
+
+            color = "RED"
+
+
+        # --------------------------------------------------------
+        # Step 1:
+        # Turn everything off first.
+        # --------------------------------------------------------
+
+        if not self.all_off():
+
+            print(
+                f"[Relay] ERROR: failed to clear relays "
+                f"before switching to {color}"
+            )
+
+            # Very important:
+            # do NOT remember this color.
+            #
+            # Next main-loop iteration will retry.
+            self.last_state = None
+
+            return False
+
+
+        # --------------------------------------------------------
+        # OFF requires no additional relay.
+        # --------------------------------------------------------
+
+        if color == "OFF":
+
+            self.last_state = "OFF"
+
+            print("[Relay] Light -> OFF")
+
+            return True
+
+
+        # --------------------------------------------------------
+        # Step 2:
+        # Enable target relay.
+        # --------------------------------------------------------
 
         if color == "RED":
-            self.set_relay(0, True)
-        elif color == "YELLOW":
-            self.set_relay(1, True)
-        elif color == "GREEN":
-            self.set_relay(2, True)
-        elif color == "OFF":
-            pass
-        else:
-            print(f"[Relay] Unknown light color: {color}")
-            self.set_relay(0, True)
+            target_relay = 0
 
-        self.last_state = color
+        elif color == "YELLOW":
+            target_relay = 1
+
+        elif color == "GREEN":
+            target_relay = 2
+
+        else:
+            # Defensive fallback.
+            target_relay = 0
+            color = "RED"
+
+
+        success = self.set_relay(
+            target_relay,
+            True
+        )
+
+
+        # --------------------------------------------------------
+        # Step 3:
+        # Update last_state ONLY after successful write.
+        # --------------------------------------------------------
+
+        if success:
+
+            self.last_state = color
+
+            print(f"[Relay] Light -> {color}")
+
+            return True
+
+
+        # --------------------------------------------------------
+        # Failed:
+        # don't cache the requested state.
+        #
+        # This guarantees that next call retries it.
+        # --------------------------------------------------------
+
+        print(
+            f"[Relay] ERROR: failed to switch "
+            f"light to {color}"
+        )
+
+        self.last_state = None
+
+        return False
+
+
+# ================================================================
+# Standalone test
+# ================================================================
+
+if __name__ == "__main__":
+
+    relay = RS485RelayController(
+        port="/dev/ttyUSB1",
+        baudrate=9600,
+        timeout=0.5,
+        retry_count=3
+    )
+
+    if not relay.open():
+        print("[TEST] Cannot open relay")
+        raise SystemExit(1)
+
+    try:
+
+        print("[TEST] RED")
+        relay.set_light("RED")
+        time.sleep(3)
+
+        print("[TEST] GREEN")
+        relay.set_light("GREEN")
+        time.sleep(3)
+
+        print("[TEST] YELLOW")
+        relay.set_light("YELLOW")
+        time.sleep(3)
+
+        print("[TEST] RED")
+        relay.set_light("RED")
+        time.sleep(3)
+
+        print("[TEST] OFF")
+        relay.set_light("OFF")
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        relay.close()

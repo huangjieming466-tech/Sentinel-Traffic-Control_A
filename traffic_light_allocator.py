@@ -79,7 +79,7 @@ class TrafficLightAllocator:
     MIN_GREEN_TIME = 5.0    # Minimum green light duration
     MAX_GREEN_TIME = 30.0   # Maximum green light duration (force switch)
     YELLOW_TIME = 3.0       # Yellow light duration
-    ALL_RED_TIME = 2.0      # All-red clearance interval
+    ALL_RED_TIME = 10.0      # All-red clearance interval
     DEBOUNCE_TIME = 2.0     # Congestion must persist this long before switching
 
     # ── Congestion threshold ──
