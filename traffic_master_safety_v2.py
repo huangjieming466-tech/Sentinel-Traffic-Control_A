@@ -54,6 +54,7 @@ from rknnlite.api import RKNNLite
 
 # Import the allocator (same directory)
 from traffic_light_allocator import TrafficLightAllocator, TrafficState
+from relay_controller import RS485RelayController
 
 # ──────────────────────────────────────────────
 #  Configuration
@@ -359,127 +360,6 @@ class LoRaDuplex:
             print("[LoRa] serial closed")
 
 
-
-# ──────────────────────────────────────────────
-#  RS485 Relay Control (Modbus RTU traffic light output)
-# ──────────────────────────────────────────────
-
-class RS485RelayController:
-    """
-    4-channel RS485 Modbus relay controller for one road traffic light.
-
-    Relay mapping:
-        relay 0 = red light
-        relay 1 = yellow light
-        relay 2 = green light
-        relay 3 = spare
-
-    Relay board default serial format: 9600, N, 8, 1.
-    """
-
-    RELAY_COMMANDS = {
-        0: {
-            True:  bytes.fromhex("01 05 00 00 FF 00 8C 3A"),
-            False: bytes.fromhex("01 05 00 00 00 00 CD CA"),
-        },
-        1: {
-            True:  bytes.fromhex("01 05 00 01 FF 00 DD FA"),
-            False: bytes.fromhex("01 05 00 01 00 00 9C 0A"),
-        },
-        2: {
-            True:  bytes.fromhex("01 05 00 02 FF 00 2D FA"),
-            False: bytes.fromhex("01 05 00 02 00 00 6C 0A"),
-        },
-        3: {
-            True:  bytes.fromhex("01 05 00 03 FF 00 7C 3A"),
-            False: bytes.fromhex("01 05 00 03 00 00 3D CA"),
-        },
-    }
-
-    def __init__(self, port=RELAY_PORT, baudrate=RELAY_BAUDRATE, timeout=0.5):
-        self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self.ser = None
-        self.last_light = None
-
-    def open(self):
-        try:
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                bytesize=8,
-                parity=serial.PARITY_NONE,
-                stopbits=1,
-                timeout=self.timeout
-            )
-            print(f"[Relay] RS485 relay opened on {self.port} (baudrate={self.baudrate})")
-            self.all_off()
-            return True
-        except Exception as e:
-            print(f"[Relay] Error: cannot open RS485 relay {self.port}: {e}")
-            return False
-
-    def close(self):
-        try:
-            self.all_off()
-            if self.ser:
-                self.ser.close()
-                print("[Relay] RS485 relay closed")
-        except Exception as e:
-            print(f"[Relay] close error: {e}")
-
-    def _send(self, cmd):
-        if not self.ser:
-            return False
-        try:
-            self.ser.write(cmd)
-            self.ser.flush()
-            time.sleep(0.03)
-            return True
-        except Exception as e:
-            print(f"[Relay] send failed: {e}")
-            return False
-
-    def set_relay(self, relay_id, on):
-        return self._send(self.RELAY_COMMANDS[relay_id][on])
-
-    def all_off(self):
-        # Turn off all channels before selecting one lamp.
-        for relay_id in range(4):
-            self.set_relay(relay_id, False)
-        self.last_light = None
-
-    def set_light(self, light):
-        """
-        Set one lamp for this board.
-
-        light values:
-            "RED", "YELLOW", "GREEN", "OFF"
-        """
-        if light == self.last_light:
-            return True
-
-        # Safety rule: never allow red/yellow/green to be on at the same time.
-        for relay_id in range(4):
-            self.set_relay(relay_id, False)
-
-        if light == "RED":
-            ok = self.set_relay(0, True)
-        elif light == "YELLOW":
-            ok = self.set_relay(1, True)
-        elif light == "GREEN":
-            ok = self.set_relay(2, True)
-        elif light == "OFF":
-            ok = True
-        else:
-            print(f"[Relay] Unknown light state {light}, fallback to RED")
-            ok = self.set_relay(0, True)
-            light = "RED"
-
-        if ok:
-            self.last_light = light
-        return ok
 
 # ──────────────────────────────────────────────
 #  Visualization
