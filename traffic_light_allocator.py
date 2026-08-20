@@ -54,9 +54,11 @@ class TrafficState(Enum):
     GREEN_A = 1    # Road A green, Road B red
     YELLOW_A = 2   # Road A yellow, Road B red
     ALL_RED_A = 5  # All red (clearing after A→B transition)
+    RED_YELLOW_B = 7  # Road B red+yellow (about to go green)
     GREEN_B = 3    # Road B green, Road A red
     YELLOW_B = 4   # Road B yellow, Road A red
     ALL_RED_B = 6  # All red (clearing after B→A transition)
+    RED_YELLOW_A = 8  # Road A red+yellow (about to go green)
 
 
 class TrafficLightAllocator:
@@ -76,10 +78,11 @@ class TrafficLightAllocator:
     """
 
     # ── Timing parameters (seconds) ──
-    MIN_GREEN_TIME = 5.0    # Minimum green light duration
+    MIN_GREEN_TIME = 8.0    # Minimum green light duration
     MAX_GREEN_TIME = 30.0   # Maximum green light duration (force switch)
     YELLOW_TIME = 3.0       # Yellow light duration
-    ALL_RED_TIME = 10.0      # All-red clearance interval
+    ALL_RED_TIME = 15.0      # All-red clearance interval
+    RED_YELLOW_TIME = 2.0   # Red+yellow transition before green
     DEBOUNCE_TIME = 2.0     # Congestion must persist this long before switching
 
     # ── Congestion threshold ──
@@ -151,7 +154,9 @@ class TrafficLightAllocator:
         elif self.current_state == TrafficState.YELLOW_A:
             remaining = self._handle_yellow(current_time, elapsed_time, TrafficState.ALL_RED_A)
         elif self.current_state == TrafficState.ALL_RED_A:
-            remaining = self._handle_all_red(current_time, elapsed_time, TrafficState.GREEN_B)
+            remaining = self._handle_all_red(current_time, elapsed_time, TrafficState.RED_YELLOW_B)
+        elif self.current_state == TrafficState.RED_YELLOW_B:
+            remaining = self._handle_red_yellow(current_time, elapsed_time, TrafficState.GREEN_B)
         elif self.current_state == TrafficState.GREEN_B:
             remaining, score_a, score_b = self._handle_green_b(
                 current_time, elapsed_time,
@@ -159,7 +164,9 @@ class TrafficLightAllocator:
         elif self.current_state == TrafficState.YELLOW_B:
             remaining = self._handle_yellow(current_time, elapsed_time, TrafficState.ALL_RED_B)
         elif self.current_state == TrafficState.ALL_RED_B:
-            remaining = self._handle_all_red(current_time, elapsed_time, TrafficState.GREEN_A)
+            remaining = self._handle_all_red(current_time, elapsed_time, TrafficState.RED_YELLOW_A)
+        elif self.current_state == TrafficState.RED_YELLOW_A:
+            remaining = self._handle_red_yellow(current_time, elapsed_time, TrafficState.GREEN_A)
 
         self.remaining_time = max(0.0, remaining)
 
@@ -332,6 +339,18 @@ class TrafficLightAllocator:
             self._transition_to(next_state, current_time)
 
         return self.ALL_RED_TIME - elapsed_time
+
+    def _handle_red_yellow(self, current_time, elapsed_time, next_state):
+        """Handle RED_YELLOW_A/B: red+yellow together before green."""
+        if self.current_state == TrafficState.RED_YELLOW_B:
+            self.color_b = (0, 165, 255)  # orange (red+yellow mix, BGR)
+        else:
+            self.color_a = (0, 165, 255)  # orange (red+yellow mix, BGR)
+
+        if elapsed_time > self.RED_YELLOW_TIME:
+            self._transition_to(next_state, current_time)
+
+        return self.RED_YELLOW_TIME - elapsed_time
 
     def _transition_to(self, new_state, current_time):
         """Perform a state transition."""

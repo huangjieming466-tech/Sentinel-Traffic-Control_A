@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+                           #!/usr/bin/env python3
 """
 traffic_master.py - Board A Master Controller
 =============================================
@@ -586,6 +586,8 @@ def main():
                 if relay is not None: relay.set_light("GREEN")
             elif state == TrafficState.YELLOW_A:
                 if relay is not None: relay.set_light("YELLOW")
+            elif state == TrafficState.RED_YELLOW_A:
+                if relay is not None: relay.set_light("RED_YELLOW")
             else:
                 if relay is not None: relay.set_light("RED")
 

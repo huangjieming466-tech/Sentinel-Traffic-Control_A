@@ -256,7 +256,7 @@ class RS485RelayController:
         # Validate color
         # --------------------------------------------------------
 
-        if color not in ("RED", "YELLOW", "GREEN", "OFF"):
+        if color not in ("RED", "YELLOW", "GREEN", "RED_YELLOW", "OFF"):
 
             print(
                 f"[Relay] Unknown light color: {color}, "
@@ -264,6 +264,24 @@ class RS485RelayController:
             )
 
             color = "RED"
+
+
+        # --------------------------------------------------------
+        # RED_YELLOW: red stays on, just add yellow (NO all_off).
+        # --------------------------------------------------------
+
+        if color == "RED_YELLOW":
+
+            ok_red = self.set_relay(0, True)     # ensure red is on (idempotent)
+            ok_yellow = self.set_relay(1, True)  # add yellow
+
+            if ok_red and ok_yellow:
+                self.last_state = color
+                print("[Relay] Light -> RED_YELLOW")
+                return True
+
+            self.last_state = None
+            return False
 
 
         # --------------------------------------------------------
