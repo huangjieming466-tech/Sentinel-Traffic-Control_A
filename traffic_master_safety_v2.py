@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import serial
+import queue
 from collections import deque
 
 os.environ["GLOG_minloglevel"] = "3"
@@ -69,7 +70,7 @@ BAUDRATE = 115200
 
 # RS485 relay board for real traffic light output
 # NOTE: LoRa uses /dev/ttyUSB0, so RS485 relay normally uses /dev/ttyUSB1
-RELAY_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BH002IVA-if00-port0"
+RELAY_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BH001WWU-if00-port0"
 RELAY_BAUDRATE = 9600
 
 CONF_THRESHOLD = 0.15
@@ -177,31 +178,78 @@ class YOLOv8_Fast_PostProcess:
 # ──────────────────────────────────────────────
 
 class RTSPStreamReader:
-    """Threaded video capture for smooth frame reading."""
+    """Thread-safe video capture with automatic reconnection.
 
-    def __init__(self, capture):
-        self.cap = capture
-        self.ret = False
-        self.frame = None
+    - A background thread reads frames and pushes the latest one into a
+      Queue(maxsize=1), so the main loop never sees a torn (ret, frame) pair.
+    - When the stream drops, the reader releases the old capture and re-opens
+      the RTSP source after a delay, so the pipeline never permanently stalls.
+    """
+
+    RECONNECT_DELAY = 2.0
+
+    def __init__(self, source, width=640, height=480):
+        self.source = source
+        self.width = width
+        self.height = height
+        self.cap = None
         self.stopped = False
+        self.frame_queue = queue.Queue(maxsize=1)
 
     def start(self):
-        threading.Thread(target=self.update, args=(), daemon=True).start()
+        self._open_capture()
+        self.stopped = False
+        threading.Thread(target=self._update, args=(), daemon=True).start()
         return self
 
-    def update(self):
-        while not self.stopped:
-            if not self.cap.isOpened():
-                break
-            self.ret, self.frame = self.cap.read()
-            if not self.ret:
-                self.stopped = True
-
     def read_latest(self):
-        return self.ret, self.frame
+        try:
+            return self.frame_queue.get_nowait()
+        except queue.Empty:
+            return (False, None)
 
     def stop(self):
         self.stopped = True
+
+    def _open_capture(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap = cv2.VideoCapture(self.source)
+        if self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            return True
+        return False
+
+    def _update(self):
+        while not self.stopped:
+            if self.cap is None or not self.cap.isOpened():
+                print("[CAM] Stream lost, attempting reconnect ...")
+                if not self._open_capture():
+                    time.sleep(self.RECONNECT_DELAY)
+                    continue
+                print("[CAM] Reconnect succeeded")
+
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                print("[CAM] Frame read failed, reconnecting ...")
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+                time.sleep(self.RECONNECT_DELAY)
+                continue
+
+            try:
+                self.frame_queue.get_nowait()  # drop stale frame
+            except queue.Empty:
+                pass
+            self.frame_queue.put((True, frame))
 
 
 # ──────────────────────────────────────────────
@@ -484,24 +532,20 @@ def main():
 
     # ── 2. Init Camera ──
     print(f"[CAM] Opening camera: {CAMERA_SOURCE}")
-    cap = cv2.VideoCapture(CAMERA_SOURCE)
-    if not cap.isOpened():
-        print(f"[CAM] Error: cannot open camera {CAMERA_SOURCE}")
-        rknn.release()
-        sys.exit(1)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    stream_reader = RTSPStreamReader(cap).start()
+    stream_reader = RTSPStreamReader(CAMERA_SOURCE).start()
     time.sleep(1.0)
-    print("[CAM] Camera ready")
+    if stream_reader.cap is None or not stream_reader.cap.isOpened():
+        print(f"[CAM] WARNING: camera not reachable now ({CAMERA_SOURCE})")
+        print("[CAM]         will keep retrying in background; light control continues")
+    else:
+        print("[CAM] Camera ready")
 
     # ── 3. Init LoRa ──
     print("[LoRa] Initializing serial...")
     lora = LoRaDuplex(SERIAL_PORT, BAUDRATE)
     if not lora.open():
         print("[LoRa] ERROR: Check LoRa module connection")
-        cap.release()
+        stream_reader.stop()
         rknn.release()
         sys.exit(1)
     lora.start_receiver()
@@ -517,7 +561,6 @@ def main():
         print("[Relay] ERROR: Check RS485 relay board connection")
         lora.close()
         stream_reader.stop()
-        cap.release()
         rknn.release()
         relay = None
     else:
@@ -538,46 +581,52 @@ def main():
 
             # ── Read camera ──
             ret, frame = stream_reader.read_latest()
-            if not ret or frame is None:
-                time.sleep(0.01)
-                continue
-            frame_count += 1
-            ori_h, ori_w = frame.shape[:2]
-
-            # ── NPU inference ──
-            img = cv2.resize(frame, (640, 640))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = np.expand_dims(img, axis=0)
-            outputs = rknn.inference(inputs=[img])
-            detections = post_processor.process(outputs, ori_w, ori_h)
-
-            # ── Count Road A vehicles ──
-            class_counts = {name: 0 for name in TARGET_CLASS_NAMES}
-            for det in detections:
-                cls_name = det['class']
-                conf_score = det['conf']
-                if cls_name in class_counts:
-                    class_counts[cls_name] += 1
-                    # Draw bounding box
-                    x, y_b, w_box, h_box = det['box']
-                    label = f"{cls_name} {conf_score:.2f}"
-                    cv2.rectangle(frame, (x, y_b), (x + w_box, y_b + h_box), (0, 255, 0), 2)
-                    cv2.putText(frame, label, (x, max(y_b - 10, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            count_a = sum(class_counts.values())
+            a_cam_ok = (ret is not None and frame is not None)
 
             # ── Get Road B data from LoRa ──
             b_counts, count_b, b_last_update = lora.get_b_data()
             b_fresh = lora.is_b_data_fresh()
 
-            # When B data is stale, reset count_b = 0.
-            # Pure MAX_GREEN_TIME state machine, no congestion guesses.
+            # ── Road A vehicle count (camera-dependent) ──
+            detections = []
+            class_counts = {name: 0 for name in TARGET_CLASS_NAMES}
+            if a_cam_ok:
+                frame_count += 1
+                ori_h, ori_w = frame.shape[:2]
 
-            # ── Reset B data when stale ──
+                # NPU inference
+                img = cv2.resize(frame, (640, 640))
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = np.expand_dims(img, axis=0)
+                outputs = rknn.inference(inputs=[img])
+                detections = post_processor.process(outputs, ori_w, ori_h)
+
+                # Count Road A vehicles
+                for det in detections:
+                    cls_name = det['class']
+                    conf_score = det['conf']
+                    if cls_name in class_counts:
+                        class_counts[cls_name] += 1
+                        # Draw bounding box
+                        x, y_b, w_box, h_box = det['box']
+                        label = f"{cls_name} {conf_score:.2f}"
+                        cv2.rectangle(frame, (x, y_b), (x + w_box, y_b + h_box), (0, 255, 0), 2)
+                        cv2.putText(frame, label, (x, max(y_b - 10, 20)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                count_a = sum(class_counts.values())
+            else:
+                count_a = 0
+
+            # ── B data stale → count_b = 0 ──
             if not b_fresh:
                 count_b = 0
 
-            # ── Run allocator ──
+            # ── Any side unreliable → symmetric fixed-time cycle ──
+            if not (a_cam_ok and b_fresh):
+                count_a = 0
+                count_b = 0
+
+            # ── Run allocator (decision + light control always runs) ──
             state, remaining, color_a, color_b, is_green_a, is_green_b, score_a, score_b = \
                 allocator.update(count_a, count_b)
 
@@ -597,22 +646,22 @@ def main():
                 lora.send_light_command(state, remaining)
                 last_light_send = now
 
-            # ── Draw master display ──
-            frame = draw_master_display(
-                frame, detections, class_counts, count_a,
-                allocator, b_counts, count_b, b_fresh, fps)
-
-            # ── Show ──
-            show_frame = cv2.resize(frame, (1280, 720))
-            cv2.imshow("Traffic Master (Board A)", show_frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('r'):
-                # Manual reset
-                allocator.reset()
-                print("[MAIN] Allocator manually reset")
+            # ── Draw + show (only when a frame is available) ──
+            if a_cam_ok:
+                frame = draw_master_display(
+                    frame, detections, class_counts, count_a,
+                    allocator, b_counts, count_b, b_fresh, fps)
+                show_frame = cv2.resize(frame, (1280, 720))
+                cv2.imshow("Traffic Master (Board A)", show_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('r'):
+                    # Manual reset
+                    allocator.reset()
+                    print("[MAIN] Allocator manually reset")
+            else:
+                time.sleep(0.01)
 
             # ── FPS ──
             elapsed = time.time() - frame_start
@@ -632,7 +681,6 @@ def main():
         if relay is not None: relay.close()
         lora.close()
         stream_reader.stop()
-        cap.release()
         rknn.release()
         cv2.destroyAllWindows()
         print("[MAIN] Resources released, exiting")

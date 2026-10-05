@@ -79,14 +79,14 @@ class TrafficLightAllocator:
 
     # ── Timing parameters (seconds) ──
     MIN_GREEN_TIME = 8.0    # Minimum green light duration
-    MAX_GREEN_TIME = 30.0   # Maximum green light duration (force switch)
+    MAX_GREEN_TIME = 15.0   # Maximum green light duration (force switch)
     YELLOW_TIME = 3.0       # Yellow light duration
     ALL_RED_TIME = 15.0      # All-red clearance interval
     RED_YELLOW_TIME = 2.0   # Red+yellow transition before green
     DEBOUNCE_TIME = 2.0     # Congestion must persist this long before switching
 
     # ── Congestion threshold ──
-    MIN_VEHICLES_FOR_SWITCH = 2  # Opposing road needs at least this many vehicles
+    MIN_VEHICLES_FOR_SWITCH = 1  # Opposing road needs at least this many vehicles
 
     # ── Score weight ──
     WAIT_WEIGHT = 10.0  # Divisor for wait_time in patience score
