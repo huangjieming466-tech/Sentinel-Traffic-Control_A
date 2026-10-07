@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import serial
+import json
 import queue
 from collections import deque
 
@@ -569,6 +570,7 @@ def main():
     # ── 5. Main Loop ──
     frame_count = 0
     last_light_send = 0
+    last_status_write = 0
     fps = 0.0
     fps_smooth = deque(maxlen=30)
 
@@ -645,6 +647,21 @@ def main():
             if now - last_light_send > LIGHT_SEND_INTERVAL:
                 lora.send_light_command(state, remaining)
                 last_light_send = now
+
+            # ── Periodically read actual relay status (0.5s) → file ──
+            if now - last_status_write > 0.5:
+                last_status_write = now
+                actual = relay.read_status() if relay is not None else None
+                try:
+                    with open("/tmp/relay_actual.json", "w") as f:
+                        f.write(json.dumps({
+                            "actual": actual,
+                            "state": state.name,
+                            "remaining": remaining,
+                            "t": now,
+                        }))
+                except Exception:
+                    pass
 
             # ── Draw + show (only when a frame is available) ──
             if a_cam_ok:
