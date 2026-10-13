@@ -567,10 +567,30 @@ def main():
     else:
         print("[Relay] A-side traffic light output ready")
 
-    # ── 5. Main Loop ──
+    # ── 5. Relay status monitor thread (independent of main loop) ──
+    relay_state = {"state": "UNKNOWN", "remaining": 0.0}
+
+    def relay_monitor_loop():
+        """后台线程：定期读继电器真实状态并写文件，不阻塞主循环"""
+        while True:
+            actual = relay.read_status() if relay is not None else None
+            try:
+                with open("/tmp/relay_actual.json", "w") as f:
+                    f.write(json.dumps({
+                        "actual": actual,
+                        "state": relay_state["state"],
+                        "remaining": relay_state["remaining"],
+                        "t": time.time(),
+                    }))
+            except Exception:
+                pass
+            time.sleep(1)
+
+    threading.Thread(target=relay_monitor_loop, daemon=True).start()
+
+    # ── 6. Main Loop ──
     frame_count = 0
     last_light_send = 0
-    last_status_write = 0
     fps = 0.0
     fps_smooth = deque(maxlen=30)
 
@@ -648,20 +668,9 @@ def main():
                 lora.send_light_command(state, remaining)
                 last_light_send = now
 
-            # ── Periodically read actual relay status (0.5s) → file ──
-            if now - last_status_write > 0.5:
-                last_status_write = now
-                actual = relay.read_status() if relay is not None else None
-                try:
-                    with open("/tmp/relay_actual.json", "w") as f:
-                        f.write(json.dumps({
-                            "actual": actual,
-                            "state": state.name,
-                            "remaining": remaining,
-                            "t": now,
-                        }))
-                except Exception:
-                    pass
+            # ── 更新共享状态（供监控线程写文件用）──
+            relay_state["state"] = state.name
+            relay_state["remaining"] = remaining
 
             # ── Draw + show (only when a frame is available) ──
             if a_cam_ok:
